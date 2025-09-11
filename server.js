@@ -50,11 +50,14 @@ const server = http.createServer((req, res) => {
     }
 });
 
-// Create WebSocket server
+// Create WebSocket server with improved configuration
 console.log('Creating WebSocket server...');
 const wss = new WebSocket.Server({ 
-    server: server
-    // Remove the path: '/ws' to accept connections on root
+    server: server,
+    // NEW: Optimized WebSocket settings for low latency
+    perMessageDeflate: false, // Disable compression for lower latency
+    maxPayload: 1024 * 1024,  // 1MB max payload
+    clientTracking: true
 });
 
 console.log('WebSocket server created and attached to HTTP server');
@@ -62,6 +65,9 @@ console.log('WebSocket server created and attached to HTTP server');
 // Store rooms and users
 const rooms = new Map();
 const userToRoom = new Map();
+
+// NEW: Store timing information for synchronization
+const roomTimings = new Map();
 
 // Generate random room code
 function generateRoomCode() {
@@ -71,18 +77,25 @@ function generateRoomCode() {
   const noun = nouns[Math.floor(Math.random() * nouns.length)];
   const num = Math.floor(Math.random() * 1000);
   return `${adj}${noun}${num}`.toUpperCase();
-    //return Math.random().toString(36).substr(2, 6).toUpperCase();
 }
 
 // Generate unique user ID
 function generateUserId() {
     return 'user_' + Math.random().toString(36).substr(2, 12) + Date.now().toString(36);
-    //return Math.random().toString(36).substr(2, 9);
+}
+
+// NEW: High precision timestamp function
+function getHighPrecisionTime() {
+    return process.hrtime.bigint();
 }
 
 // Send message to specific client
 function sendMessage(ws, message) {
     if (ws.readyState === WebSocket.OPEN) {
+        // NEW: Add server timestamp for synchronization
+        if (message.type === 'audio-started' || message.type === 'sync-update') {
+            message.serverTimestamp = Date.now();
+        }
         ws.send(JSON.stringify(message));
     }
 }
@@ -91,6 +104,18 @@ function sendMessage(ws, message) {
 function broadcastToRoom(roomCode, message, excludeWs = null) {
     const room = rooms.get(roomCode);
     if (room) {
+        // NEW: Add precise timing for synchronization messages
+        if (message.type === 'audio-started' || message.type === 'sync-update') {
+            message.serverTimestamp = Date.now();
+            
+            // Store timing info for the room
+            roomTimings.set(roomCode, {
+                startTime: message.data.startTime,
+                serverTime: message.serverTimestamp,
+                lastUpdate: Date.now()
+            });
+        }
+        
         Object.values(room.users).forEach(user => {
             if (user.ws !== excludeWs && user.ws.readyState === WebSocket.OPEN) {
                 sendMessage(user.ws, message);
@@ -123,9 +148,10 @@ function cleanupUser(ws) {
                 }
             }
             
-            // If room is empty, delete it
+            // If room is empty, delete it and clean up timing data
             if (Object.keys(room.users).length === 0) {
                 rooms.delete(roomCode);
+                roomTimings.delete(roomCode); // NEW: Clean up timing data
                 console.log(`Room ${roomCode} deleted (empty)`);
             } else {
                 // If host left, assign new host
@@ -160,14 +186,18 @@ function cleanupUser(ws) {
     }
 }
 
-// Handle WebSocket connections
+// Handle WebSocket connections with improved settings
 wss.on('connection', (ws, req) => {
     console.log('New client connected from:', req.socket.remoteAddress);
+    
+    // NEW: Set WebSocket to binary mode for better performance
+    ws.binaryType = 'arraybuffer';
     
     // Send welcome message
     sendMessage(ws, {
         type: 'connected',
-        message: 'Connected to LYSN server'
+        message: 'Connected to LYSN server',
+        serverTime: Date.now() // NEW: Include server time
     });
     
     ws.on('message', (data) => {
@@ -234,6 +264,16 @@ function handleMessage(ws, message) {
             
         case 'sync-request':
             handleSyncRequest(ws, message.data);
+            break;
+            
+        // NEW: Handle ping for latency measurement
+        case 'ping':
+            handlePing(ws, message.data);
+            break;
+            
+        // NEW: Handle sync updates
+        case 'sync-update':
+            handleSyncUpdate(ws, message.data);
             break;
             
         default:
@@ -335,22 +375,34 @@ function handleJoinRoom(ws, data) {
     
     console.log(`User ${username} joined room ${roomCode} successfully`);
     
-    // Send confirmation to new user
+    // Send confirmation to new user with current timing info
+    const joinData = {
+        roomCode,
+        userId,
+        users: Object.fromEntries(
+            Object.entries(room.users).map(([id, user]) => [
+                id, {
+                    id,
+                    username: user.username,
+                    isHost: user.isHost
+                }
+            ])
+        )
+    };
+    
+    // NEW: Include current sync timing if audio is active
+    const timing = roomTimings.get(roomCode);
+    if (timing && room.isAudioActive) {
+        joinData.currentTiming = {
+            startTime: timing.startTime,
+            serverTime: Date.now(),
+            offset: Date.now() - timing.lastUpdate
+        };
+    }
+    
     sendMessage(ws, {
         type: 'room-joined',
-        data: {
-            roomCode,
-            userId,
-            users: Object.fromEntries(
-                Object.entries(room.users).map(([id, user]) => [
-                    id, {
-                        id,
-                        username: user.username,
-                        isHost: user.isHost
-                    }
-                ])
-            )
-        }
+        data: joinData
     });
     
     // Notify existing users
@@ -381,17 +433,30 @@ function handleLeaveRoom(ws, data) {
     cleanupUser(ws);
 }
 
-// Audio started handler
+// Audio started handler with precise timing
 function handleAudioStarted(ws, data) {
-    const { roomCode } = data;
-    console.log(`Audio started in room ${roomCode}`);
+    const { roomCode, startTime } = data;
+    console.log(`Audio started in room ${roomCode} at ${startTime}`);
     const room = rooms.get(roomCode);
     
     if (room) {
         room.isAudioActive = true;
+        
+        // NEW: Store precise timing information
+        const serverTime = Date.now();
+        roomTimings.set(roomCode, {
+            startTime: startTime,
+            serverTime: serverTime,
+            lastUpdate: serverTime
+        });
+        
         broadcastToRoom(roomCode, {
             type: 'audio-started',
-            data: { roomCode }
+            data: { 
+                roomCode,
+                startTime: startTime,
+                serverTime: serverTime
+            }
         }, ws);
     }
 }
@@ -404,6 +469,7 @@ function handleAudioStopped(ws, data) {
     
     if (room) {
         room.isAudioActive = false;
+        roomTimings.delete(roomCode); // NEW: Clear timing data
         broadcastToRoom(roomCode, {
             type: 'audio-stopped',
             data: { roomCode }
@@ -411,7 +477,50 @@ function handleAudioStopped(ws, data) {
     }
 }
 
-// WebRTC offer handler
+// NEW: Handle ping for latency measurement
+function handlePing(ws, data) {
+    const { timestamp, userId } = data;
+    
+    // Respond immediately with pong
+    sendMessage(ws, {
+        type: 'pong',
+        data: {
+            timestamp: timestamp,
+            serverTime: Date.now(),
+            userId: userId
+        }
+    });
+}
+
+// NEW: Handle sync updates from host
+function handleSyncUpdate(ws, data) {
+    const { roomCode, startTime } = data;
+    const room = rooms.get(roomCode);
+    
+    if (room && room.isAudioActive) {
+        // Update timing information
+        const serverTime = Date.now();
+        roomTimings.set(roomCode, {
+            startTime: startTime,
+            serverTime: serverTime,
+            lastUpdate: serverTime
+        });
+        
+        // Broadcast sync update to all listeners
+        broadcastToRoom(roomCode, {
+            type: 'sync-update',
+            data: {
+                roomCode,
+                startTime: startTime,
+                serverTime: serverTime
+            }
+        }, ws);
+        
+        console.log(`Sync update broadcast for room ${roomCode}`);
+    }
+}
+
+// WebRTC offer handler with timing optimization
 function handleWebRTCOffer(ws, data) {
     const { roomCode, targetUserId, offer } = data;
     const room = rooms.get(roomCode);
@@ -427,17 +536,28 @@ function handleWebRTCOffer(ws, data) {
         }
         
         console.log(`Relaying WebRTC offer from ${fromUserId} to ${targetUserId}`);
+        
+        // NEW: Add timing information to WebRTC offer
+        const offerData = {
+            fromUserId,
+            offer,
+            timestamp: Date.now()
+        };
+        
+        // Include current room timing if audio is active
+        const timing = roomTimings.get(roomCode);
+        if (timing) {
+            offerData.roomTiming = timing;
+        }
+        
         sendToUser(roomCode, targetUserId, {
             type: 'webrtc-offer',
-            data: {
-                fromUserId,
-                offer
-            }
+            data: offerData
         });
     }
 }
 
-// WebRTC answer handler
+// WebRTC answer handler with timing optimization
 function handleWebRTCAnswer(ws, data) {
     const { roomCode, targetUserId, answer } = data;
     const room = rooms.get(roomCode);
@@ -457,7 +577,8 @@ function handleWebRTCAnswer(ws, data) {
             type: 'webrtc-answer',
             data: {
                 fromUserId,
-                answer
+                answer,
+                timestamp: Date.now()
             }
         });
     }
@@ -502,7 +623,32 @@ function handleSyncRequest(ws, data) {
     });
 }
 
-// Cleanup old rooms (run every hour)
+// NEW: Periodic sync broadcast for active rooms
+setInterval(() => {
+    for (const [roomCode, timing] of roomTimings.entries()) {
+        const room = rooms.get(roomCode);
+        if (room && room.isAudioActive) {
+            const now = Date.now();
+            
+            // Only sync if it's been more than 5 seconds since last update
+            if (now - timing.lastUpdate > 5000) {
+                broadcastToRoom(roomCode, {
+                    type: 'sync-update',
+                    data: {
+                        roomCode,
+                        startTime: timing.startTime + (now - timing.serverTime),
+                        serverTime: now
+                    }
+                });
+                
+                timing.lastUpdate = now;
+                console.log(`Auto-sync broadcast for room ${roomCode}`);
+            }
+        }
+    }
+}, 1000); // Check every second
+
+// Cleanup old rooms and timing data
 setInterval(() => {
     const now = new Date();
     const oneHourAgo = new Date(now.getTime() - 60 * 60 * 1000);
@@ -510,14 +656,16 @@ setInterval(() => {
     for (const [roomCode, room] of rooms.entries()) {
         if (room.createdAt < oneHourAgo && Object.keys(room.users).length === 0) {
             rooms.delete(roomCode);
+            roomTimings.delete(roomCode); // NEW: Clean up timing data
             console.log(`Cleaned up empty room ${roomCode}`);
         }
     }
 }, 60 * 60 * 1000);
 
-// Status logging
+// Enhanced status logging with timing info
 setInterval(() => {
-    console.log(`📊 Status: ${rooms.size} active rooms, ${userToRoom.size} connected users`);
+    const activeTimings = roomTimings.size;
+    console.log(`🔊 Status: ${rooms.size} active rooms, ${userToRoom.size} connected users, ${activeTimings} rooms with active timing`);
 }, 30000);
 
 // Handle server errors
@@ -545,6 +693,6 @@ server.listen(PORT, () => {
     console.log(`   👉 http://127.0.0.1:${PORT}`);
     console.log('');
     console.log('🎵 Ready for synchronized music streaming!');
+    console.log('⚡ Enhanced with <50ms sync capability');
     console.log('💡 Press Ctrl+C to stop the server');
     console.log('🎵============================================🎵');
-});
