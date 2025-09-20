@@ -662,6 +662,42 @@ setInterval(() => {
     }
 }, 60 * 60 * 1000);
 
+// NEW: Handle ping for latency measurement
+function handlePing(ws, data) {
+    const { timestamp, userId } = data;
+    
+    // Respond immediately with pong
+    sendMessage(ws, {
+        type: 'pong',
+        data: {
+            timestamp: timestamp,
+            serverTime: Date.now(),
+            userId: userId
+        }
+    });
+}
+
+// NEW: Handle sync updates from host
+function handleSyncUpdate(ws, data) {
+    const { roomCode, startTime } = data;
+    const room = rooms.get(roomCode);
+    
+    if (room) {
+        // Broadcast sync update to all listeners
+        broadcastToRoom(roomCode, {
+            type: 'sync-update',
+            data: {
+                roomCode,
+                startTime: startTime,
+                serverTime: Date.now()
+            }
+        }, ws);
+        
+        console.log(`Sync update broadcast for room ${roomCode}`);
+    }
+}
+
+// Cleanup old rooms (run every hour)
 // Enhanced status logging with timing info
 setInterval(() => {
     const activeTimings = roomTimings.size;
@@ -697,3 +733,4 @@ server.listen(PORT, () => {
     console.log('💡 Press Ctrl+C to stop the server');
     console.log('🎵============================================🎵');
 });
+
